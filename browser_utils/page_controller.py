@@ -859,7 +859,7 @@ class PageController:
             self.logger.warning(f"[{self.req_id}] 快捷键提交失败: {shortcut_err}")
             return False
 
-    async def get_response(self, check_client_disconnected: Callable) -> str:
+    async def get_response(self, check_client_disconnected: Callable, monitor: Optional[Any] = None) -> str:
         """获取响应内容。"""
         self.logger.info(f"[{self.req_id}] 等待并获取响应...")
 
@@ -879,7 +879,7 @@ class PageController:
 
             self.logger.info(f"[{self.req_id}] 等待响应完成...")
             completion_detected = await _wait_for_response_completion(
-                self.page, input_field_locator, submit_button_locator, edit_button_locator, self.req_id, check_client_disconnected, None
+                self.page, input_field_locator, submit_button_locator, edit_button_locator, self.req_id, check_client_disconnected, None, monitor
             )
 
             if not completion_detected:

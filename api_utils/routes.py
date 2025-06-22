@@ -192,7 +192,7 @@ async def chat_completions(
     result_future = Future()
     await request_queue.put({
         "req_id": req_id, "request_data": request, "http_request": http_request,
-        "result_future": result_future, "enqueue_time": time.time(), "cancelled": False
+        "result_future": result_future, "enqueue_time": time.monotonic(), "cancelled": False
     })
     
     try:

@@ -264,7 +264,8 @@ async def _prepare_and_validate_request(req_id: str, request: ChatCompletionRequ
 
 async def _handle_response_processing(req_id: str, request: ChatCompletionRequest, page: AsyncPage,
                                     context: dict, result_future: Future,
-                                    submit_button_locator: Locator, check_client_disconnected: Callable) -> Optional[Tuple[Event, Locator, Callable]]:
+                                    submit_button_locator: Locator, check_client_disconnected: Callable,
+                                    monitor: "PerformanceMonitor") -> Optional[Tuple[Event, Locator, Callable]]:
     """处理响应生成"""
     from server import logger
     
@@ -276,14 +277,15 @@ async def _handle_response_processing(req_id: str, request: ChatCompletionReques
     use_stream = stream_port != '0'
     
     if use_stream:
-        return await _handle_auxiliary_stream_response(req_id, request, context, result_future, submit_button_locator, check_client_disconnected)
+        return await _handle_auxiliary_stream_response(req_id, request, context, result_future, submit_button_locator, check_client_disconnected, monitor)
     else:
-        return await _handle_playwright_response(req_id, request, page, context, result_future, submit_button_locator, check_client_disconnected)
+        return await _handle_playwright_response(req_id, request, page, context, result_future, submit_button_locator, check_client_disconnected, monitor)
 
 
-async def _handle_auxiliary_stream_response(req_id: str, request: ChatCompletionRequest, context: dict, 
-                                          result_future: Future, submit_button_locator: Locator, 
-                                          check_client_disconnected: Callable) -> Optional[Tuple[Event, Locator, Callable]]:
+async def _handle_auxiliary_stream_response(req_id: str, request: ChatCompletionRequest, context: dict,
+                                          result_future: Future, submit_button_locator: Locator,
+                                          check_client_disconnected: Callable,
+                                          monitor: "PerformanceMonitor") -> Optional[Tuple[Event, Locator, Callable]]:
     """使用辅助流处理响应"""
     from server import logger
     
@@ -311,9 +313,13 @@ async def _handle_auxiliary_stream_response(req_id: str, request: ChatCompletion
 
                 # 数据接收状态标记
                 data_receiving = False
+                first_token_marked = False
 
                 try:
                     async for raw_data in use_stream_response(req_id):
+                        if not first_token_marked:
+                            monitor.mark("response_first_token")
+                            first_token_marked = True
                         # 标记数据接收状态
                         data_receiving = True
 
@@ -633,9 +639,10 @@ async def _handle_auxiliary_stream_response(req_id: str, request: ChatCompletion
         return None
 
 
-async def _handle_playwright_response(req_id: str, request: ChatCompletionRequest, page: AsyncPage, 
-                                    context: dict, result_future: Future, submit_button_locator: Locator, 
-                                    check_client_disconnected: Callable) -> Optional[Tuple[Event, Locator, Callable]]:
+async def _handle_playwright_response(req_id: str, request: ChatCompletionRequest, page: AsyncPage,
+                                    context: dict, result_future: Future, submit_button_locator: Locator,
+                                    check_client_disconnected: Callable,
+                                    monitor: "PerformanceMonitor") -> Optional[Tuple[Event, Locator, Callable]]:
     """使用Playwright处理响应"""
     from server import logger
     
@@ -670,11 +677,16 @@ async def _handle_playwright_response(req_id: str, request: ChatCompletionReques
         async def create_response_stream_generator():
             # 数据接收状态标记
             data_receiving = False
+            first_token_marked = False
 
             try:
                 # 使用PageController获取响应
                 page_controller = PageController(page, logger, req_id)
-                final_content = await page_controller.get_response(check_client_disconnected)
+                final_content = await page_controller.get_response(check_client_disconnected, monitor)
+
+                if not first_token_marked:
+                    monitor.mark("response_first_token")
+                    first_token_marked = True
 
                 # 标记数据接收状态
                 data_receiving = True
@@ -746,7 +758,8 @@ async def _handle_playwright_response(req_id: str, request: ChatCompletionReques
     else:
         # 使用PageController获取响应
         page_controller = PageController(page, logger, req_id)
-        final_content = await page_controller.get_response(check_client_disconnected)
+        final_content = await page_controller.get_response(check_client_disconnected, monitor)
+        monitor.mark("response_first_token")
         
         # 计算token使用统计
         usage_stats = calculate_usage_stats(
@@ -801,7 +814,8 @@ async def _process_request_refactored(
     req_id: str,
     request: ChatCompletionRequest,
     http_request: Request,
-    result_future: Future
+    result_future: Future,
+    monitor: "PerformanceMonitor"
 ) -> Optional[Tuple[Event, Locator, Callable[[str], bool]]]:
     """核心请求处理函数 - 重构版本"""
 
@@ -830,7 +844,9 @@ async def _process_request_refactored(
         
         page_controller = PageController(page, context['logger'], req_id)
 
+        monitor.mark('model_switching_start')
         await _handle_model_switching(req_id, context, check_client_disconnected)
+        monitor.mark('model_switching_end')
         await _handle_parameter_cache(req_id, context)
         
         prepared_prompt,image_list = await _prepare_and_validate_request(req_id, request, check_client_disconnected)
@@ -838,6 +854,7 @@ async def _process_request_refactored(
         # 使用PageController处理页面交互
         # 注意：聊天历史清空已移至队列处理锁释放后执行
 
+        monitor.mark('parameter_adjustment_start')
         await page_controller.adjust_parameters(
             request.model_dump(exclude_none=True), # 使用 exclude_none=True 避免传递None值
             context['page_params_cache'],
@@ -846,16 +863,21 @@ async def _process_request_refactored(
             context['parsed_model_list'],
             check_client_disconnected
         )
+        monitor.mark('parameter_adjustment_end')
 
         # 优化：在提交提示前再次检查客户端连接，避免不必要的后台请求
         check_client_disconnected("提交提示前最终检查")
 
+        monitor.mark('prompt_submission_start')
         await page_controller.submit_prompt(prepared_prompt,image_list, check_client_disconnected)
+        monitor.mark('prompt_submission_end')
         
         # 响应处理仍然需要在这里，因为它决定了是流式还是非流式，并设置future
+        monitor.mark('response_processing_start')
         response_result = await _handle_response_processing(
-            req_id, request, page, context, result_future, submit_button_locator, check_client_disconnected
+            req_id, request, page, context, result_future, submit_button_locator, check_client_disconnected, monitor
         )
+        monitor.mark('response_processing_end')
         
         if response_result:
             completion_event, _, _ = response_result

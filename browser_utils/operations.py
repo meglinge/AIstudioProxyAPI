@@ -676,6 +676,7 @@ async def _wait_for_response_completion(
     req_id: str,
     check_client_disconnected_func: Callable,
     current_chat_id: Optional[str],
+    monitor: Optional[Any] = None,
     timeout_ms=RESPONSE_COMPLETION_TIMEOUT,
     initial_wait_ms=INITIAL_WAIT_MS_BEFORE_POLLING
 ) -> bool:
@@ -689,6 +690,7 @@ async def _wait_for_response_completion(
     wait_timeout_ms_short = 3000 # 3 seconds for individual element checks
     
     consecutive_empty_input_submit_disabled_count = 0
+    first_token_marked = False
     
     while True:
         try:
@@ -716,6 +718,19 @@ async def _wait_for_response_completion(
         except TimeoutError:
             logger.warning(f"[{req_id}] (WaitV3) 检查提交按钮是否禁用超时。为本次检查假定其未禁用。")
         
+        if monitor and not first_token_marked:
+            # 检查响应内容是否出现，用于标记首包时间
+            try:
+                response_text_locator = page.locator(RESPONSE_TEXT_SELECTOR).last
+                if await response_text_locator.count() > 0:
+                    content = await response_text_locator.inner_text(timeout=500)
+                    if content.strip():
+                        monitor.mark("response_first_token")
+                        first_token_marked = True
+                        logger.info(f"[{req_id}] (Perf) 已标记 response_first_token。")
+            except Exception:
+                pass # 忽略错误，继续轮询
+
         try:
             check_client_disconnected_func("等待响应完成 - 按钮状态检查后")
         except ClientDisconnectedError:

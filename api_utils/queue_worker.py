@@ -7,13 +7,15 @@ import asyncio
 import time
 from fastapi import HTTPException
 
+from api_utils.performance import PerformanceMonitor
+from config.settings import ENABLE_PERFORMANCE_MONITORING
 
 
 async def queue_worker():
     """队列工作器，处理请求队列中的任务"""
     # 导入全局变量
     from server import (
-        logger, request_queue, processing_lock, model_switching_lock, 
+        logger, request_queue, processing_lock, model_switching_lock,
         params_cache_lock
     )
     
@@ -100,6 +102,11 @@ async def queue_worker():
             request_data = request_item["request_data"]
             http_request = request_item["http_request"]
             result_future = request_item["result_future"]
+            enqueue_time = request_item.get("enqueue_time")
+
+            # 初始化性能监视器
+            monitor = PerformanceMonitor(req_id, enabled=ENABLE_PERFORMANCE_MONITORING)
+            monitor.mark("worker_start_processing")
 
             if request_item.get("cancelled", False):
                 logger.info(f"[{req_id}] (Worker) 请求已取消，跳过。")
@@ -139,6 +146,7 @@ async def queue_worker():
             
             logger.info(f"[{req_id}] (Worker) 等待处理锁...")
             async with processing_lock:
+                monitor.mark("acquired_processing_lock")
                 logger.info(f"[{req_id}] (Worker) 已获取处理锁。开始核心处理...")
                 
                 # 获取锁后最终主动检测客户端连接
@@ -154,7 +162,7 @@ async def queue_worker():
                     try:
                         from api_utils import _process_request_refactored
                         returned_value = await _process_request_refactored(
-                            req_id, request_data, http_request, result_future
+                            req_id, request_data, http_request, result_future, monitor
                         )
                         
                         completion_event, submit_btn_loc, client_disco_checker = None, None, None
@@ -311,6 +319,7 @@ async def queue_worker():
                             result_future.set_exception(HTTPException(status_code=500, detail=f"[{req_id}] Request processing error: {process_err}"))
             
             logger.info(f"[{req_id}] (Worker) 释放处理锁。")
+            monitor.mark("lock_released")
 
             # 在释放处理锁后立即执行清空操作
             try:
@@ -331,6 +340,9 @@ async def queue_worker():
                     logger.info(f"[{req_id}] (Worker) 跳过聊天历史清空：缺少必要参数（submit_btn_loc: {bool(submit_btn_loc)}, client_disco_checker: {bool(client_disco_checker)}）")
             except Exception as clear_err:
                 logger.error(f"[{req_id}] (Worker) 清空操作时发生错误: {clear_err}", exc_info=True)
+            
+            monitor.mark("cleanup_finished")
+            monitor.log_summary(logger, enqueue_time)
 
             was_last_request_streaming = is_streaming_request
             last_request_completion_time = time.time()
